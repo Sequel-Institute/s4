@@ -914,7 +914,18 @@ class SSMKernelDPLR(SSMKernelDiag):
 
         # Prepare Linear stepping
         D = (2.0 / dt - A).reciprocal()  # (H, N)
-        R = (torch.eye(self.rank, dtype=A.dtype, device=A.device) + 2*contract('r h n, h n, s h n -> h r s', Q, D, P).real) # (H R R)
+
+        # MPS doesn't support complex einsum operations, so move to CPU if needed
+        device = A.device
+        if device.type == 'mps' and A.dtype in [torch.complex64, torch.complex128]:
+            Q_cpu = Q.cpu()
+            D_cpu = D.cpu()
+            P_cpu = P.cpu()
+            R = (torch.eye(self.rank, dtype=A.dtype, device='cpu') + 2*contract('r h n, h n, s h n -> h r s', Q_cpu, D_cpu, P_cpu).real)
+            R = R.to(device)
+        else:
+            R = (torch.eye(self.rank, dtype=A.dtype, device=A.device) + 2*contract('r h n, h n, s h n -> h r s', Q, D, P).real) # (H R R)
+
         Q_D = rearrange(Q*D, 'r h n -> h r n')
         try:
             R = torch.linalg.solve(R, Q_D) # (H R N)
