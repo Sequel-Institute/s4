@@ -3,7 +3,10 @@
 import torch
 from einops import rearrange, repeat
 
-contract = torch.einsum
+# Import MPS-compatible operations
+from src.utils.mps_compat import mps_einsum
+
+contract = mps_einsum
 
 try:
     import pykeops

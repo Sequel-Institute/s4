@@ -9,7 +9,10 @@ from src.models.sequence import SequenceModule
 from src.models.sequence.kernels import registry as kernel_registry
 from src.models.nn import Activation, DropoutNd
 
-contract = torch.einsum
+# Import MPS-compatible operations
+from src.utils.mps_compat import mps_einsum
+
+contract = mps_einsum
 
 class FFTConv(SequenceModule):
     """Implements an FFT Convolution around a convolution kernel.

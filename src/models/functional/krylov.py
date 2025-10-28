@@ -20,6 +20,9 @@ from einops import rearrange, repeat
 
 from src.models.functional.toeplitz import causal_convolution
 
+# Import MPS-compatible operations
+from src.utils.mps_compat import mps_matmul
+
 def krylov_sequential(L, A, b, c=None):
     """Compute the krylov function naively by sequential powering.
 
@@ -49,7 +52,7 @@ def krylov_sequential(L, A, b, c=None):
         else:
             x_ = b_
         x.append(x_)
-        b_ = (A @ b_.unsqueeze(-1)).squeeze(-1)
+        b_ = (mps_matmul(A, b_.unsqueeze(-1))).squeeze(-1)
 
     x = torch.stack(x, dim=-1)
     return x
@@ -74,7 +77,7 @@ def krylov(L, A, b, c=None, return_power=False):
     # loop invariant: _L represents how many indices left to compute
     while not done:
         if return_power:
-            if _L % 2 == 1: AL = A_ @ AL
+            if _L % 2 == 1: AL = mps_matmul(A_, AL)
             _L //= 2
 
         # Save memory on last iteration
@@ -84,9 +87,9 @@ def krylov(L, A, b, c=None, return_power=False):
             _x = x[..., :L-l]
         else: _x = x
 
-        _x = A_ @ _x
+        _x = mps_matmul(A_, _x)
         x = torch.cat([x, _x], dim=-1) # there might be a more efficient way of ordering axes
-        if not done: A_ = A_ @ A_
+        if not done: A_ = mps_matmul(A_, A_)
 
     assert x.shape[-1] == L
 
@@ -111,14 +114,14 @@ def power(L, A, v=None):
     powers = [A]
     l = 1
     while True:
-        if L % 2 == 1: I = powers[-1] @ I
+        if L % 2 == 1: I = mps_matmul(powers[-1], I)
         L //= 2
         if L == 0: break
         l *= 2
         if v is None:
-            powers = [powers[-1] @ powers[-1]]
+            powers = [mps_matmul(powers[-1], powers[-1])]
         else:
-            powers.append(powers[-1] @ powers[-1])
+            powers.append(mps_matmul(powers[-1], powers[-1]))
 
     if v is None: return I
 
@@ -134,14 +137,14 @@ def power(L, A, v=None):
     # Take care of edge case for non-po2 arrays
     # Note that this initial step is a no-op for the case of power of 2 (l == L)
     k = v.size(-1) - l
-    v_ = powers.pop() @ v[..., l:]
+    v_ = mps_matmul(powers.pop(), v[..., l:])
     v = v[..., :l]
     v[..., :k] = v[..., :k] + v_
 
     # Handle reduction for power of 2
     while v.size(-1) > 1:
         v = rearrange(v, '... (z l) -> ... z l', z=2)
-        v = v[..., 0, :] + powers.pop() @ v[..., 1, :]
+        v = v[..., 0, :] + mps_matmul(powers.pop(), v[..., 1, :])
     return I, v.squeeze(-1)
 
 def krylov_toeplitz(L, A, b, c=None):
