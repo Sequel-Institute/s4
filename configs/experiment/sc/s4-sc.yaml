@@ -32,3 +32,10 @@ scheduler:
 
 train:
   seed: 2222
+
+mlflow:
+  enabled: true
+  experiment_name: "S4 Speech Commands MFCC"
+
+dataset:
+  mfcc: true

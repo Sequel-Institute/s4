@@ -1,0 +1,12 @@
+# MLflow logging configuration
+# Set `~mlflow` or `mlflow=null` or `mlflow.enabled=false` to disable MLflow logging
+mlflow:
+  enabled: true
+  experiment_name: "S4 Default Experiment Name"  # Name of the MLflow experiment
+  system_metrics_interval: 1  # Sampling interval for system metrics (seconds)
+  log_every_n_epoch: 1  # Log model metrics every N epochs
+  log_models: true  # Whether to log the model
+  checkpoint: true  # Whether to log checkpoints
+  # tracking_uri: null  # Optional: MLflow tracking URI (defaults to local ./mlruns)
+  # run_name: null  # Optional: Custom run name
+

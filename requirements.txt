@@ -12,6 +12,7 @@ pytorch-lightning==2.0.4
 hydra-core
 omegaconf
 wandb
+mlflow
 einops
 cmake # For pykeops support
 # pykeops # Seems to cause various issues; leaving uninstalled by default

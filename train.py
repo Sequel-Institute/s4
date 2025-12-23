@@ -1,21 +1,20 @@
-import copy
 import os
 import random
 import time
-from functools import partial, wraps
-from typing import Callable, List, Optional
+from functools import wraps
+from typing import Callable, List
 
 import hydra
-import numpy as np
+import mlflow
+import mlflow.pytorch
 import pytorch_lightning as pl
 import torch
-import torch.nn as nn
 import wandb
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
+from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.utilities import rank_zero_only, rank_zero_warn
-from tqdm.auto import tqdm
 
 import src.models.nn.utils as U
 import src.utils as utils
@@ -30,6 +29,7 @@ log = src.utils.train.get_logger(__name__)
 
 # Turn on TensorFloat32 (speeds up large model training substantially)
 import torch.backends
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -66,8 +66,118 @@ def rank_zero_experiment(fn: Callable) -> Callable:
     return experiment
 
 
-class CustomWandbLogger(WandbLogger):
+class MLflowTimingCallback(Callback):
+    """Track and log timing statistics for training epochs to MLflow."""
 
+    def __init__(self):
+        """Initialize timing callback."""
+        super().__init__()
+        self.epoch_times = []
+        self.epoch_start_time = None
+        self.training_start_time = None
+
+    def on_train_start(self, trainer, pl_module):
+        """Record training start time.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        self.training_start_time = time.time()
+        log.info("Training started")
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        """Record epoch start time.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        self.epoch_start_time = time.time()
+        log.info(f"Epoch {trainer.current_epoch} started")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Calculate and log epoch timing.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        epoch_time = time.time() - self.epoch_start_time
+        self.epoch_times.append(epoch_time)
+
+        # Log to console
+        log.info(f"Epoch {trainer.current_epoch} completed in {epoch_time:.2f}s")
+
+        # Log to MLflow
+        try:
+            mlflow.log_metric(
+                "epoch_time_seconds", epoch_time, step=trainer.current_epoch
+            )
+
+            # Calculate and log running statistics
+            avg_time = sum(self.epoch_times) / len(self.epoch_times)
+            min_time = min(self.epoch_times)
+            max_time = max(self.epoch_times)
+
+            mlflow.log_metric(
+                "avg_epoch_time_seconds", avg_time, step=trainer.current_epoch
+            )
+            mlflow.log_metric(
+                "min_epoch_time_seconds", min_time, step=trainer.current_epoch
+            )
+            mlflow.log_metric(
+                "max_epoch_time_seconds", max_time, step=trainer.current_epoch
+            )
+
+            log.info(
+                f"  Avg epoch time: {avg_time:.2f}s, Min: {min_time:.2f}s, Max: {max_time:.2f}s"
+            )
+        except Exception as e:
+            log.warning(f"Failed to log epoch timing to MLflow: {e}")
+
+    def on_train_end(self, trainer, pl_module):
+        """Calculate and log total training statistics.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        total_time = time.time() - self.training_start_time
+
+        log.info("=" * 80)
+        log.info("Training completed!")
+        log.info(
+            f"Total training time: {total_time:.2f}s ({total_time/60:.2f} minutes)"
+        )
+        log.info(f"Number of epochs: {len(self.epoch_times)}")
+
+        if self.epoch_times:
+            avg_time = sum(self.epoch_times) / len(self.epoch_times)
+            min_time = min(self.epoch_times)
+            max_time = max(self.epoch_times)
+            std_dev = torch.tensor(self.epoch_times).std().item()
+
+            log.info("Epoch timing statistics:")
+            log.info(f"  Average: {avg_time:.2f}s")
+            log.info(f"  Minimum: {min_time:.2f}s")
+            log.info(f"  Maximum: {max_time:.2f}s")
+            log.info(f"  Std dev: {std_dev:.2f}s")
+            log.info("=" * 80)
+
+            # Log summary metrics to MLflow
+            try:
+                mlflow.log_metric("total_training_time_seconds", total_time)
+                mlflow.log_metric("total_training_time_minutes", total_time / 60)
+                mlflow.log_metric("final_avg_epoch_time_seconds", avg_time)
+                mlflow.log_metric("final_min_epoch_time_seconds", min_time)
+                mlflow.log_metric("final_max_epoch_time_seconds", max_time)
+                mlflow.log_metric("epoch_time_std_dev_seconds", std_dev)
+            except Exception as e:
+                log.warning(f"Failed to log final timing metrics to MLflow: {e}")
+
+
+class CustomWandbLogger(WandbLogger):
     def __init__(self, *args, **kwargs):
         """Modified logger that insists on a wandb.init() call and catches wandb's error if thrown."""
 
@@ -113,7 +223,9 @@ class CustomWandbLogger(WandbLogger):
                 # define default x-axis
                 if getattr(self._experiment, "define_metric", None):
                     self._experiment.define_metric("trainer/global_step")
-                    self._experiment.define_metric("*", step_metric="trainer/global_step", step_sync=True)
+                    self._experiment.define_metric(
+                        "*", step_metric="trainer/global_step", step_sync=True
+                    )
 
         return self._experiment
 
@@ -167,9 +279,9 @@ class SequenceLightningModule(pl.LightningModule):
 
         # Instantiate model
         self.model = utils.instantiate(registry.model, self.hparams.model)
-        if (name := self.hparams.train.post_init_hook['_name_']) is not None:
+        if (name := self.hparams.train.post_init_hook["_name_"]) is not None:
             kwargs = self.hparams.train.post_init_hook.copy()
-            del kwargs['_name_']
+            del kwargs["_name_"]
             for module in self.modules():
                 if hasattr(module, name):
                     getattr(module, name)(**kwargs)
@@ -192,7 +304,7 @@ class SequenceLightningModule(pl.LightningModule):
         self.decoder = U.PassthroughSequential(decoder, self.task.decoder)
         self.loss = self.task.loss
         self.loss_val = self.task.loss
-        if hasattr(self.task, 'loss_val'):
+        if hasattr(self.task, "loss_val"):
             self.loss_val = self.task.loss_val
         self.metrics = self.task.metrics
 
@@ -200,7 +312,7 @@ class SequenceLightningModule(pl.LightningModule):
         self._initialize_state()
 
     def load_state_dict(self, state_dict, strict=True):
-        if self.hparams.train.pretrained_model_state_hook['_name_'] is not None:
+        if self.hparams.train.pretrained_model_state_hook["_name_"] is not None:
             model_state_hook = utils.instantiate(
                 registry.model_state_hook,
                 self.hparams.train.pretrained_model_state_hook.copy(),
@@ -215,7 +327,14 @@ class SequenceLightningModule(pl.LightningModule):
         return super().load_state_dict(state_dict, strict=strict)
 
     def _check_config(self):
-        assert self.hparams.train.state.mode in [None, "none", "null", "reset", "bptt", "tbptt"]
+        assert self.hparams.train.state.mode in [
+            None,
+            "none",
+            "null",
+            "reset",
+            "bptt",
+            "tbptt",
+        ]
         assert (
             (n := self.hparams.train.state.n_context) is None
             or isinstance(n, int)
@@ -258,7 +377,7 @@ class SequenceLightningModule(pl.LightningModule):
         n_context = self.hparams.train.state.get(key)
 
         # Don't need to do anything if 0 context steps. Make sure there is no state
-        if n_context == 0 and self.hparams.train.state.mode not in ['tbptt']:
+        if n_context == 0 and self.hparams.train.state.mode not in ["tbptt"]:
             self._initialize_state()
             return
 
@@ -277,7 +396,7 @@ class SequenceLightningModule(pl.LightningModule):
             self._memory_chunks.append(batch)
             self._memory_chunks = self._memory_chunks[-n_context:]
 
-        elif self.hparams.train.state.mode == 'tbptt':
+        elif self.hparams.train.state.mode == "tbptt":
             _, _, z = batch
             reset = z["reset"]
             if reset:
@@ -291,21 +410,27 @@ class SequenceLightningModule(pl.LightningModule):
     def forward(self, batch):
         """Passes a batch through the encoder, backbone, and decoder"""
         # z holds arguments such as sequence length
-        x, y, *z = batch # z holds extra dataloader info such as resolution
+        x, y, *z = batch  # z holds extra dataloader info such as resolution
         if len(z) == 0:
             z = {}
         else:
-            assert len(z) == 1 and isinstance(z[0], dict), "Dataloader must return dictionary of extra arguments"
+            assert len(z) == 1 and isinstance(
+                z[0], dict
+            ), "Dataloader must return dictionary of extra arguments"
             z = z[0]
 
-        x, w = self.encoder(x, **z) # w can model-specific constructions such as key_padding_mask for transformers or state for RNNs
+        x, w = self.encoder(
+            x, **z
+        )  # w can model-specific constructions such as key_padding_mask for transformers or state for RNNs
         x, state = self.model(x, **w, state=self._state)
         self._state = state
         x, w = self.decoder(x, state=state, **z)
         return x, y, w
 
     def step(self, x_t):
-        x_t, *_ = self.encoder(x_t) # Potential edge case for encoders that expect (B, L, H)?
+        x_t, *_ = self.encoder(
+            x_t
+        )  # Potential edge case for encoders that expect (B, L, H)?
         x_t, state = self.model.step(x_t, state=self._state)
         self._state = state
         # x_t = x_t[:, None, ...] # Dummy length
@@ -315,13 +440,12 @@ class SequenceLightningModule(pl.LightningModule):
         return x_t
 
     def _shared_step(self, batch, batch_idx, prefix="train"):
-
         self._process_state(batch, batch_idx, train=(prefix == "train"))
 
         x, y, w = self.forward(batch)
 
         # Loss
-        if prefix == 'train':
+        if prefix == "train":
             loss = self.loss(x, y, **w)
         else:
             loss = self.loss_val(x, y, **w)
@@ -454,15 +578,15 @@ class SequenceLightningModule(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-
         # Set zero weight decay for some params
-        if 'optimizer_param_grouping' in self.hparams.train:
-            add_optimizer_hooks(self.model, **self.hparams.train.optimizer_param_grouping)
+        if "optimizer_param_grouping" in self.hparams.train:
+            add_optimizer_hooks(
+                self.model, **self.hparams.train.optimizer_param_grouping
+            )
 
         # Normal parameters
         all_params = list(self.parameters())
         params = [p for p in all_params if not hasattr(p, "_optim")]
-
 
         # Construct optimizer, add EMA if necessary
         if self.hparams.train.ema > 0.0:
@@ -474,7 +598,9 @@ class SequenceLightningModule(pl.LightningModule):
                 polyak=self.hparams.train.ema,
             )
         else:
-            optimizer = utils.instantiate(registry.optimizer, self.hparams.optimizer, params)
+            optimizer = utils.instantiate(
+                registry.optimizer, self.hparams.optimizer, params
+            )
 
         del self.hparams.optimizer._name_
 
@@ -482,7 +608,8 @@ class SequenceLightningModule(pl.LightningModule):
         hps = [getattr(p, "_optim") for p in all_params if hasattr(p, "_optim")]
         hps = [
             # dict(s) for s in set(frozenset(hp.items()) for hp in hps)
-            dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
+            dict(s)
+            for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
             # dict(s) for s in dict.fromkeys(frozenset(hp.items()) for hp in hps)
         ]  # Unique dicts
         print("Hyperparameter groups", hps)
@@ -494,10 +621,10 @@ class SequenceLightningModule(pl.LightningModule):
 
         ### Layer Decay ###
 
-        if self.hparams.train.layer_decay['_name_'] is not None:
+        if self.hparams.train.layer_decay["_name_"] is not None:
             get_num_layer = utils.instantiate(
                 registry.layer_decay,
-                self.hparams.train.layer_decay['_name_'],
+                self.hparams.train.layer_decay["_name_"],
                 partial=True,
             )
 
@@ -511,17 +638,20 @@ class SequenceLightningModule(pl.LightningModule):
                 # Add to layer wise group
                 if layer_id not in layer_wise_groups:
                     layer_wise_groups[layer_id] = {
-                        'params': [],
-                        'lr': None,
-                        'weight_decay': self.hparams.optimizer.weight_decay
+                        "params": [],
+                        "lr": None,
+                        "weight_decay": self.hparams.optimizer.weight_decay,
                     }
-                layer_wise_groups[layer_id]['params'].append(p)
+                layer_wise_groups[layer_id]["params"].append(p)
 
-                if layer_id > num_max_layers: num_max_layers = layer_id
+                if layer_id > num_max_layers:
+                    num_max_layers = layer_id
 
             # Update lr for each layer
             for layer_id, group in layer_wise_groups.items():
-                group['lr'] = self.hparams.optimizer.lr * (self.hparams.train.layer_decay.decay ** (num_max_layers - layer_id))
+                group["lr"] = self.hparams.optimizer.lr * (
+                    self.hparams.train.layer_decay.decay ** (num_max_layers - layer_id)
+                )
 
             # Reset the torch optimizer's param groups
             optimizer.param_groups = []
@@ -553,8 +683,8 @@ class SequenceLightningModule(pl.LightningModule):
         # Print stats in a try block since some dataloaders might not have a length?
         try:
             log.info(
-                f"Loaded 'train' dataloader:".ljust(30) +
-                f"{len(train_loader.dataset):7} examples | {len(train_loader):6} steps"
+                "Loaded 'train' dataloader:".ljust(30)
+                + f"{len(train_loader.dataset):7} examples | {len(train_loader):6} steps"
             )
         except:
             pass
@@ -604,8 +734,8 @@ class SequenceLightningModule(pl.LightningModule):
         try:
             for name, loader in zip(val_loader_names, val_loaders):
                 log.info(
-                    f"Loaded '{name}' dataloader:".ljust(30) +
-                    f"{len(loader.dataset):7} examples | {len(loader):6} steps"
+                    f"Loaded '{name}' dataloader:".ljust(30)
+                    + f"{len(loader.dataset):7} examples | {len(loader):6} steps"
                 )
         except:
             pass
@@ -619,6 +749,7 @@ class SequenceLightningModule(pl.LightningModule):
 
 
 ### pytorch-lightning utils and entrypoint ###
+
 
 def create_trainer(config):
     callbacks: List[pl.Callback] = []
@@ -636,10 +767,17 @@ def create_trainer(config):
             **config.wandb,
         )
 
+    # MLflow Timing Callback
+    if config.get("mlflow") is not None and config.mlflow.get("enabled", True):
+        timing_callback = MLflowTimingCallback()
+        callbacks.append(timing_callback)
+        log.info("Added MLflow timing callback")
+
     # Lightning callbacks
     if "callbacks" in config:
         for _name_, callback in config.callbacks.items():
-            if callback is None: continue
+            if callback is None:
+                continue
             if config.get("wandb") is None and _name_ in ["learning_rate_monitor"]:
                 continue
             log.info(f"Instantiating callback <{registry.callbacks[_name_]}>")
@@ -652,9 +790,8 @@ def create_trainer(config):
         profiler = hydra.utils.instantiate(config.trainer.profiler)
         config.trainer.pop("profiler")
 
-
     # Configure ddp automatically
-    if config.trainer.accelerator == 'gpu' and config.trainer.devices > 1:
+    if config.trainer.accelerator == "gpu" and config.trainer.devices > 1:
         print("ddp automatically configured, more than 1 gpu used!")
         config.trainer.strategy = "ddp"
 
@@ -695,6 +832,35 @@ def create_trainer(config):
 def train(config):
     if config.train.seed is not None:
         pl.seed_everything(config.train.seed, workers=True)
+
+    # Setup MLflow if enabled
+    mlflow_enabled = config.get("mlflow") is not None and config.mlflow.get(
+        "enabled", True
+    )
+    if mlflow_enabled:
+        try:
+            # Set experiment name
+            experiment_name = config.mlflow.get("experiment_name", "S4 Training")
+            mlflow.set_experiment(experiment_name)
+            log.info(f"MLflow experiment set to: {experiment_name}")
+
+            # Enable system metrics logging
+            mlflow.config.enable_system_metrics_logging()
+            mlflow.config.set_system_metrics_sampling_interval(
+                config.mlflow.get("system_metrics_interval", 1)
+            )
+
+            # Enable PyTorch autologging
+            mlflow.pytorch.autolog(
+                log_every_n_epoch=config.mlflow.get("log_every_n_epoch", 1),
+                log_models=config.mlflow.get("log_models", True),
+                checkpoint=config.mlflow.get("checkpoint", True),
+            )
+            log.info("MLflow PyTorch autologging enabled")
+        except Exception as e:
+            log.warning(f"Failed to setup MLflow: {e}")
+            mlflow_enabled = False
+
     trainer = create_trainer(config)
     model = SequenceLightningModule(config)
 
@@ -720,21 +886,137 @@ def train(config):
             model.load_state_dict(pretrained_dict)
         if config.train.get("pretrained_freeze_encoder", False):
             for name, param in model.named_parameters():
-                if not("decoder" in name): param.requires_grad = False
+                if "decoder" not in name:
+                    param.requires_grad = False
 
+    # Start MLflow run if enabled
+    if mlflow_enabled:
+        try:
+            mlflow.start_run()
+            run = mlflow.active_run()
+            log.info(f"Started MLflow run: {run.info.run_id}")
+
+            # Log model and experiment information as tags
+            mlflow.set_tag("model_name", config.model.get("_name_", "unknown"))
+            mlflow.set_tag(
+                "experiment_name", config.get("experiment", {}).get("_name_", "unknown")
+            )
+            mlflow.set_tag("dataset_name", config.dataset.get("_name_", "unknown"))
+            mlflow.set_tag("task_name", config.task.get("_name_", "unknown"))
+
+            # Determine and log accelerator
+            accel = config.trainer.get("accelerator", "cpu")
+            mlflow.set_tag("accelerator", accel)
+
+            if accel == "gpu" and torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+                mlflow.set_tag("device_name", device_name)
+                log.info(f"CUDA device: {device_name}")
+
+            # Count and log model parameters
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            log.info(f"Total parameters: {total_params:,}")
+            log.info(f"Trainable parameters: {trainable_params:,}")
+
+            # Log hyperparameters
+            params_to_log = {}
+
+            # Model hyperparameters
+            if hasattr(config, "model"):
+                for key, value in config.model.items():
+                    if not key.startswith("_") and not isinstance(
+                        value, (dict, list, DictConfig)
+                    ):
+                        params_to_log[f"model_{key}"] = value
+
+            # Training hyperparameters
+            if hasattr(config, "train"):
+                params_to_log["seed"] = config.train.get("seed", None)
+                params_to_log["ema"] = config.train.get("ema", 0.0)
+
+            # Optimizer hyperparameters
+            if hasattr(config, "optimizer"):
+                for key, value in config.optimizer.items():
+                    if not key.startswith("_") and not isinstance(
+                        value, (dict, list, DictConfig)
+                    ):
+                        params_to_log[f"optimizer_{key}"] = value
+
+            # Scheduler hyperparameters
+            if hasattr(config, "scheduler"):
+                for key, value in config.scheduler.items():
+                    if not key.startswith("_") and not isinstance(
+                        value, (dict, list, DictConfig)
+                    ):
+                        params_to_log[f"scheduler_{key}"] = value
+
+            # Loader hyperparameters
+            if hasattr(config, "loader"):
+                for key, value in config.loader.items():
+                    if not key.startswith("_") and not isinstance(
+                        value, (dict, list, DictConfig)
+                    ):
+                        params_to_log[f"loader_{key}"] = value
+
+            # Trainer hyperparameters
+            if hasattr(config, "trainer"):
+                params_to_log["max_epochs"] = config.trainer.get("max_epochs", None)
+                params_to_log["devices"] = config.trainer.get("devices", 1)
+
+            # Model architecture parameters
+            params_to_log["total_params"] = total_params
+            params_to_log["trainable_params"] = trainable_params
+
+            # Log all parameters
+            mlflow.log_params(params_to_log)
+            log.info("MLflow parameters logged")
+
+        except Exception as e:
+            log.warning(f"Failed to start MLflow run or log parameters: {e}")
+            mlflow_enabled = False
 
     # Run initial validation epoch (useful for debugging, finetuning)
     if config.train.validate_at_start:
         print("Running validation before training")
         trainer.validate(model)
 
-    if config.train.ckpt is not None:
-        trainer.fit(model, ckpt_path=config.train.ckpt)
-    else:
-        trainer.fit(model)
-    if config.train.test:
-        trainer.test(model)
+    try:
+        if config.train.ckpt is not None:
+            trainer.fit(model, ckpt_path=config.train.ckpt)
+        else:
+            trainer.fit(model)
+        if config.train.test:
+            trainer.test(model)
 
+        # Mark MLflow run as successful
+        if mlflow_enabled:
+            try:
+                mlflow.set_tag("status", "completed")
+                log.info("MLflow run completed successfully")
+            except Exception as e:
+                log.warning(f"Failed to set MLflow completion tag: {e}")
+
+    except Exception as e:
+        # Mark MLflow run as failed
+        if mlflow_enabled:
+            try:
+                mlflow.set_tag("status", "failed")
+                mlflow.set_tag("error", str(e))
+                log.error(f"Training failed: {e}")
+            except Exception as mlflow_error:
+                log.warning(f"Failed to log error to MLflow: {mlflow_error}")
+        raise
+    finally:
+        # End MLflow run
+        if mlflow_enabled:
+            try:
+                mlflow.end_run()
+                log.info("MLflow run ended")
+            except Exception as e:
+                log.warning(f"Failed to end MLflow run: {e}")
 
 
 def preemption_setup(config):
@@ -742,7 +1024,9 @@ def preemption_setup(config):
         return config
 
     # Create path ./logdir/id/ to store information for resumption
-    resume_dir = os.path.join(get_original_cwd(), config.tolerance.logdir, str(config.tolerance.id))
+    resume_dir = os.path.join(
+        get_original_cwd(), config.tolerance.logdir, str(config.tolerance.id)
+    )
 
     if os.path.exists(resume_dir):
         print(f"Resuming from {resume_dir}")
@@ -754,7 +1038,7 @@ def preemption_setup(config):
         # Look at the previous runs in reverse order
         checkpoint_path = None
         for hydra_path in reversed(hydra_paths):
-            hydra_path = hydra_path.rstrip('\n')
+            hydra_path = hydra_path.rstrip("\n")
 
             # Get the paths to the last.ckpt and last_.ckpt files
             last_path = os.path.join(hydra_path, "checkpoints", "last.ckpt")
@@ -794,9 +1078,13 @@ def preemption_setup(config):
             print("\tNo suitable checkpoint found, starting from scratch")
 
         # Set wandb run id to resume
-        if os.path.exists(os.path.join(hydra_path, 'wandb')):
-            run_info = [e for e in os.listdir(os.path.join(hydra_path, 'wandb')) if e.startswith('run-')][0]
-            run_id = run_info.split('-')[-1]
+        if os.path.exists(os.path.join(hydra_path, "wandb")):
+            run_info = [
+                e
+                for e in os.listdir(os.path.join(hydra_path, "wandb"))
+                if e.startswith("run-")
+            ][0]
+            run_id = run_info.split("-")[-1]
             try:
                 config.wandb.id = run_id
             except AttributeError:
@@ -805,15 +1093,14 @@ def preemption_setup(config):
     os.makedirs(resume_dir, exist_ok=True)
 
     # Store path to Hydra output folder
-    with open(os.path.join(resume_dir, 'hydra.txt'), 'a') as f:
-        f.write(os.getcwd() + '\n')
+    with open(os.path.join(resume_dir, "hydra.txt"), "a") as f:
+        f.write(os.getcwd() + "\n")
 
     return config
 
 
 @hydra.main(config_path="configs", config_name="config.yaml")
 def main(config: OmegaConf):
-
     # Process config:
     # - register evaluation resolver
     # - filter out keys used only for interpolation
