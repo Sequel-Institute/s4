@@ -23,6 +23,8 @@ optimizer:
 
 loader:
   batch_size: 16
+  eval_resolutions:
+    - 1  # Only use resolution 1 with MFCC since sequence length is 161 (odd number)
 
 trainer:
   max_epochs: 40
@@ -39,7 +41,3 @@ mlflow:
 
 dataset:
   mfcc: true
-
-loader:
-  eval_resolutions:
-    - 1  # Only use resolution 1 with MFCC since sequence length is 161 (odd number)
