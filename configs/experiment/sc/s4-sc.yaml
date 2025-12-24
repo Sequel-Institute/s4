@@ -39,3 +39,7 @@ mlflow:
 
 dataset:
   mfcc: true
+
+loader:
+  eval_resolutions:
+    - 1  # Only use resolution 1 with MFCC since sequence length is 161 (odd number)
