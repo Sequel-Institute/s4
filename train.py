@@ -66,6 +66,88 @@ def rank_zero_experiment(fn: Callable) -> Callable:
     return experiment
 
 
+class MLflowMetricsCallback(Callback):
+    """Log training and validation metrics to MLflow."""
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Log training metrics to MLflow.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        if not mlflow.active_run():
+            return
+
+        try:
+            # Get logged metrics from trainer
+            metrics = trainer.logged_metrics
+            step = trainer.current_epoch
+
+            # Log all train metrics to MLflow
+            for key, value in metrics.items():
+                if key.startswith("train/") and isinstance(
+                    value, (int, float, torch.Tensor)
+                ):
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    mlflow.log_metric(key, float(value), step=step)
+        except Exception as e:
+            log.warning(f"Failed to log training metrics to MLflow: {e}")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Log validation metrics to MLflow.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        if not mlflow.active_run():
+            return
+
+        try:
+            # Get logged metrics from trainer
+            metrics = trainer.logged_metrics
+            step = trainer.current_epoch
+
+            # Log all validation metrics to MLflow
+            for key, value in metrics.items():
+                if key.startswith("val/") and isinstance(
+                    value, (int, float, torch.Tensor)
+                ):
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    mlflow.log_metric(key, float(value), step=step)
+        except Exception as e:
+            log.warning(f"Failed to log validation metrics to MLflow: {e}")
+
+    def on_test_epoch_end(self, trainer, pl_module):
+        """Log test metrics to MLflow.
+
+        Args:
+            trainer: PyTorch Lightning trainer instance.
+            pl_module: PyTorch Lightning module being trained.
+        """
+        if not mlflow.active_run():
+            return
+
+        try:
+            # Get logged metrics from trainer
+            metrics = trainer.logged_metrics
+            step = trainer.current_epoch
+
+            # Log all test metrics to MLflow
+            for key, value in metrics.items():
+                if key.startswith("test/") and isinstance(
+                    value, (int, float, torch.Tensor)
+                ):
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    mlflow.log_metric(key, float(value), step=step)
+        except Exception as e:
+            log.warning(f"Failed to log test metrics to MLflow: {e}")
+
+
 class MLflowTimingCallback(Callback):
     """Track and log timing statistics for training epochs to MLflow."""
 
@@ -103,6 +185,9 @@ class MLflowTimingCallback(Callback):
             trainer: PyTorch Lightning trainer instance.
             pl_module: PyTorch Lightning module being trained.
         """
+        if not mlflow.active_run():
+            return
+
         epoch_time = time.time() - self.epoch_start_time
         self.epoch_times.append(epoch_time)
 
@@ -143,6 +228,9 @@ class MLflowTimingCallback(Callback):
             trainer: PyTorch Lightning trainer instance.
             pl_module: PyTorch Lightning module being trained.
         """
+        if not mlflow.active_run():
+            return
+
         total_time = time.time() - self.training_start_time
 
         log.info("=" * 80)
@@ -767,8 +855,14 @@ def create_trainer(config):
             **config.wandb,
         )
 
-    # MLflow Timing Callback
+    # MLflow Callbacks
     if config.get("mlflow") is not None and config.mlflow.get("enabled", True):
+        # Add metrics callback to log training/validation metrics
+        metrics_callback = MLflowMetricsCallback()
+        callbacks.append(metrics_callback)
+        log.info("Added MLflow metrics callback")
+
+        # Add timing callback to log training timing statistics
         timing_callback = MLflowTimingCallback()
         callbacks.append(timing_callback)
         log.info("Added MLflow timing callback")
@@ -850,13 +944,9 @@ def train(config):
                 config.mlflow.get("system_metrics_interval", 1)
             )
 
-            # Enable PyTorch autologging
-            mlflow.pytorch.autolog(
-                log_every_n_epoch=config.mlflow.get("log_every_n_epoch", 1),
-                log_models=config.mlflow.get("log_models", True),
-                checkpoint=config.mlflow.get("checkpoint", True),
-            )
-            log.info("MLflow PyTorch autologging enabled")
+            # NOTE: Autologging is disabled in favor of manual run management
+            # to avoid duplicate runs and to have better control over what's logged
+            log.info("MLflow configured with manual run management")
         except Exception as e:
             log.warning(f"Failed to setup MLflow: {e}")
             mlflow_enabled = False
